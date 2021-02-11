@@ -26,7 +26,7 @@ class WikiPage(object):
 
         print("Getting Page: " + self.title + ".")
         data = {"action": "query", "prop": "info|revisions", "inprop":"url", "rvlimit": 1,"rvprop": "content", "format": "json", "titles": self.title}
-        response = urllib.request.urlopen(self._api_url, urllib.parse.urlencode(data).encode()).read()
+        response = urllib.request.urlopen(self._api_url, (urllib.parse.urlencode(data) + "&redirects").encode()).read()
         jsonresponse = json.loads(response.decode("utf-8"))
         self.url = list(jsonresponse["query"]["pages"].values())[0]["fullurl"]
         try:
