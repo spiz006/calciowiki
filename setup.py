@@ -9,7 +9,7 @@ setup(
     author='Spiz ',
     author_email='spizster@gmail.com',
     url='https://github.com/',
-    packages=['calciowiki'],
+#    packages=['calciowiki'],
     install_requires=[
           'mwparserfromhell',
           'parsedatetime',
@@ -19,3 +19,4 @@ setup(
       ],
       zip_safe=False
     )
+ 
