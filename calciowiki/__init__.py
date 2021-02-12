@@ -12,9 +12,10 @@ from PIL import Image
 import logging
 import pandas as pd
 import numpy as np
-
+from dateutil.parser import parse
+from io import BytesIO
+import requests
 class WikiPage(object):
-    pass;
     #competition_text = {"Serie A" : "Ser A", "Champions League" : "UCL", "Europa League" : "EL", "Coppa Italia": "CI", "Friendly": "Fr"}
     _api_url = "https://en.wikipedia.org/w/api.php"
 
@@ -24,33 +25,62 @@ class WikiPage(object):
 
     def _get_page(self):
 
-        print("Getting Page: " + self.title + ".")
-        data = {"action": "query", "prop": "info|revisions", "inprop":"url", "rvlimit": 1,"rvprop": "content", "format": "json", "titles": self.title}
-        response = urllib.request.urlopen(self._api_url, (urllib.parse.urlencode(data) + "&redirects").encode()).read()
+        logging.debug(f"Getting Page: {self.title}")
+        data = {"action": "query", "prop": "info|revisions", "inprop":"url", "rvlimit": 1,"rvprop": "content", "format": "json", "titles": self.title,"redirects":1}
+        response = urllib.request.urlopen(self._api_url, urllib.parse.urlencode(data).encode()).read()
         jsonresponse = json.loads(response.decode("utf-8"))
         self.url = list(jsonresponse["query"]["pages"].values())[0]["fullurl"]
         try:
-            return mwparserfromhell.parse(list(jsonresponse["query"]["pages"].values())[0]["revisions"][0]['*'])
+            return mwparserfromhell.parse(list(jsonresponse["query"]["pages"].values())[0]["revisions"][0]['*'],skip_style_tags=True)
         except:
             return None
 
     def _get_text(self,wikicode):
         return wikicode.strip_code().strip()
 
-    def _get_timestamp (self, date, time):
+    def _get_timestamp (self, date, time=None):
         date = self._get_text(date)
-        time = self._get_text(time)
+        if time is not None:
+            time = self._get_text(time)
+            if time[:5] == "--:--":
+                time = None
         dt = timelib.mktime(timelib.strptime('24/05/2030', "%d/%m/%Y"))
-        if len(date) > 0:
+        if time is not None:
             date = date + ' ' + re.sub(r'\([^)]*\)', '', time)
-            d = parsedatetime.Calendar()
-            time_struct, parse_status = d.parse(date)
-            dt = timelib.mktime(time_struct)
-        return dt
+        try:
+            time_struct = parse(date)
+            dt = datetime.datetime.timestamp(time_struct)
+            return dt
+        except:
+            return None
+        if datetime.date.fromtimestamp(dt).year == 2030:
+            return None
 
     def _merge_date_time (self, date, time):
         dt = datetime.datetime.fromtimestamp(self._get_timestamp(date,time))
         return dt
+
+class WikiPicture(WikiPage):
+    def __init__(self, image_title,height=64,width=64):
+        try:
+            logging.info(f"Getting Image {image_title}")
+            data = {"action": "query", "prop": "imageinfo","iiprop": "url", "format": "json", "iiurlheight": height, "iiurlwidth": width, "titles": image_title}
+            response = urllib.request.urlopen(self._api_url, urllib.parse.urlencode(data).encode()).read()
+            jsonresponse = json.loads(response.decode("utf-8"))
+            image_url = list(jsonresponse["query"]["pages"].values())[0]["imageinfo"][0]["thumburl"]
+            image_response = requests.get(image_url)
+            dl_image = Image.open(BytesIO(image_response.content))
+            new_image = Image.new("RGBA", (width,height))
+            x, y = dl_image.size
+            x1 = int(width/2 - x/2)
+            y1 = int(height/2 - y/2)
+            new_image.paste(dl_image, (x1,y1))
+            self._image = new_image
+        except:
+            self._image = None
+
+    def get_image(self):
+        return self._image
 
 class WikiImage(WikiPage):
     def __init__(self, image_title, image_name, folder, color_mode="RGBA", height=64,width=64, temp_folder=os.path.join(os.sep,"usr","share","calciodb","tmp")):
@@ -66,7 +96,7 @@ class WikiImage(WikiPage):
         image_full_path = os.path.join(folder, filename + ".png")
         logging.debug(image_full_path)
         if not os.path.exists(image_full_path):
-            print("Getting %s." % filename)
+            logging.debug(f"Getting file: {filename}")
             data = {"action": "query", "prop": "imageinfo","iiprop": "url", "format": "json", "iiurlheight": height, "iiurlwidth": width, "titles": image_title}
             response = urllib.request.urlopen(self._api_url, urllib.parse.urlencode(data).encode()).read()
             jsonresponse = json.loads(response.decode("utf-8"))
@@ -76,10 +106,10 @@ class WikiImage(WikiPage):
             urllib.request.urlretrieve(image_url,temp_image)
 
             tempImage = Image.open(temp_image)
-            newImage = Image.new(color_mode, (64,64))
+            newImage = Image.new(color_mode, (width,height))
             x, y = tempImage.size
-            x1 = int(32 - x/2)
-            y1 = int(32 - y/2)
+            x1 = int(width/2 - x/2)
+            y1 = int(height/2 - y/2)
             newImage.paste(tempImage, (x1,y1))
             tempImage.close()
 
@@ -98,8 +128,13 @@ class WikiPlayer(WikiPage):
     def _parse(self):
         wikicode = self.wikicode
         page_url = self.url
-
+        juve_wikicode = None
         s = str(wikicode.get_sections(flat=True).pop(0))
+        for section in wikicode.get_sections(flat=True):
+            for heading in section.filter_headings():
+                if "Juventus" in heading:
+                    s = s + '## '+str(section)
+
         p = re.compile( '(<ref(.*?)<\/ref>)+')
         s = p.sub('',s)
         s = mwparserfromhell.parse(s)
@@ -114,6 +149,8 @@ class WikiPlayer(WikiPage):
         p = re.compile( '(\(\))+')
         s = p.sub('',s)
 
+        s = re.sub( r'===(.*)===',r'\n\n## \1 \n\n',s)
+
         s = s + "\n\nRead more about " + self.name + " [here]("+page_url+")!"
 
         title = "#" + self.name + "\n"
@@ -126,7 +163,8 @@ class WikiPlayer(WikiPage):
                 dod = None
                 other_clubs = ""
                 for x in mwparserfromhell.wikicode.parse_anything(template.get("birth_date").value).filter_templates():
-                    dob = "%s/%s/%s" % (x.get(3),x.get(2),x.get(1))
+                    if "birth date" in x.name:
+                        dob = "%s/%s/%s" % (x.get(3),x.get(2),x.get(1))
 
                 if template.has("death_date"):
                     for x in mwparserfromhell.wikicode.parse_anything(template.get("death_date").value).filter_templates():
@@ -166,20 +204,24 @@ class WikiPlayer(WikiPage):
 
                 im = "File:" + template.get("image").value.strip()
 
-                print ("Using image %s" % im)
+                logging.debug (f"Using image: {im}")
                 if im[-4] == ".":
                     wiki_image = WikiImage(im, self.name, os.path.join(os.sep,"usr","share","calciodb","potm-images"), "LA")
+                    wiki_large_image = WikiImage(im, self.name, os.path.join(os.sep,"usr","share","calciodb","potm-large-images"), height=512,width=512)
                     self.image_path = wiki_image.image_path
+                    self.large_image_path = wiki_large_image.image_path
                 else:
                     self.image_path = None
-        self.appearances = total_app
-        return {"content": title + profile + "##Bio\n\n" + s, "title":"[Player of the Month] " +  self.name + " (" + str(total_app)+" caps)",'name': self.name, 'caps':total_app }
+                self.appearances = total_app
+                return {"content": title + profile + "##Bio\n\n" + s, "title":"[Player of the Month] " +  self.name + " (" + str(total_app)+" appearances)",'name': self.name, 'caps':total_app, 'image_name': im, 'years': years, 'appearances':total_app, 'large_image':self.large_image_path, 'small_image':self.image_path,'wikipedia':page_url }
+        return {"content": title + "##Bio\n\n" + s, "title":"[Player of the Month] " +  self.name,'name': self.name, 'caps': 0}
 
 class WikiSeason(WikiPage):
     def __init__(self, title):
-        super(WikiSeason,self).__init__(title)
+        super(WikiSeason,self).__init__(title.replace('-','–'))
         self.title = title
-        self.year = title[2:7].replace('–','-')
+        years = title.split()[0].replace('–','-').split('-')
+        self.year = f"{years[0][-2:]}-{years[1][-2:]}"
         self.season = self._parse()
 
     def _parse(self):
@@ -195,6 +237,13 @@ class WikiSeason(WikiPage):
 
         for template in self.wikicode.filter_templates():
             if template.name.matches("footballbox collapsible") or template.name.matches("football box collapsible"):
+                previous_headings = []
+                found = False
+                for section in self.wikicode.get_sections(levels=[3]):
+                    if section.contains(template):
+                        previous_headings = [heading for heading in section.filter_headings()]
+                        found=True
+                comp = previous_headings[0].title.strip_code().strip() if found else "Friendly"
 
                 team1_full = self._get_text(template.get("team1").value)
                 for l in template.get("team1").value.filter_wikilinks():
@@ -209,6 +258,7 @@ class WikiSeason(WikiPage):
                     ref_name = re.sub(r'\([^)]*\)', '', self._get_text(template.get("referee").value)).strip()
                 except:
                     pass
+                time = self._get_timestamp(template.get("date").value, template.get("time").value) if template.has("time") else self._get_timestamp(template.get("date").value)
                 r = {
                         'season': self.year,
                         'home_team' : self._get_text(template.get("team1").value),
@@ -216,16 +266,20 @@ class WikiSeason(WikiPage):
                         'away_team' : self._get_text(template.get("team2").value),
                         'away_full_name':str(team2_full),
                         'referee' : ref_name,
-                        'time' : self._get_timestamp(template.get("date").value, template.get("time").value)
+                        'time' : time,
+                        'competition': comp
                     }
-
+                # print(r)
+                if time is None:
+                    logging.info(f"Match dropped - {r['season']} {r['competition']}: {r['home_team']} - {r['away_team']}")
+                    continue
                 stadium_name = "N/A"
                 try:
                     stadium_name = self._get_text(template.get("stadium").value).strip()
                 except:
                     pass
                 stadium = stadium_name
-                goals = self._get_text(template.get("score").value).split(u'\u2013')
+                goals = self._get_text(template.get("score").value).replace(u'\u2013','-').split('-')
 
                 r['home_goals'] = goals[0] if len(goals) == 2 else ""
                 r['away_goals'] = goals[1] if len(goals) == 2 else ""
@@ -250,34 +304,47 @@ class WikiSeason(WikiPage):
 
                 # GET COMPETITION
 
-                if template.has("round"):
-                    comp = template.get("round").value
-
-                    comp_title = self._get_text(comp)
-                    r['competition'] =  comp_title if len(comp_title.split()) == 1 else ".".join( [ w[0] for w in comp_title.split() ] )
-
-                    if comp.strip_code().strip().isdigit():
-                        r['competition'] = "Ser A"
-                    if "Champions League" in comp:
-                        r['competition'] = "UCL"
-                    if "Europa League" in comp:
-                        r['competition'] = "EL"
-                    if "Coppa Italia" in comp:
-                        r['competition'] = "CI"
-                    if "Friendly" in comp:
-                        r['competition'] = "Fr"
-                print(r)
+                # if template.has("round"):
+                #     comp = template.get("round").value
+                #
+                #     comp_title = self._get_text(comp)
+                #     r['competition'] =  comp_title if len(comp_title.split()) == 1 else ".".join( [ w[0] for w in comp_title.split() ] )
+                #
+                #     if comp.strip_code().strip().isdigit():
+                #         r['competition'] = "Ser A"
+                #     if "Champions League" in comp:
+                #         r['competition'] = "UCL"
+                #     if "Europa League" in comp:
+                #         r['competition'] = "EL"
+                #     if "Coppa Italia" in comp:
+                #         r['competition'] = "CI"
+                #     if "Friendly" in comp:
+                #         r['competition'] = "Fr"
                 if len(r['home_team']) > 1 or len(r['away_team']) > 1:
-                    events = pd.concat([events,self._get_events_dict(template.get('goals1').value.split("<br>"),r,r['home_team'])]) if "<br>" in template.get('goals1').value else pd.concat([events,self._get_events_dict(template.get('goals1').value.split("<br/>"),r,r['home_team'])])
-                    events = pd.concat([events,self._get_events_dict(template.get('goals2').value.split("<br>"),r,r['away_team'])]) if "<br>" in template.get('goals2').value else pd.concat([events,self._get_events_dict(template.get('goals2').value.split("<br/>"),r,r['away_team'])])
-                    matches = pd.concat([matches,pd.DataFrame([r])])
+                    linebreaks = ["<br>","<br/>","<br />","*"]
+                    goals = ['goals1','goals2']
+                    for goal_set in goals:
+                        if template.has(goal_set):
+                            goal_list = re.split(r"(<br>)|(<br/>)|(<br />)|(\*)",str(template.get(goal_set).value))
+                            for linebreak in linebreaks:
+                                if linebreak in goal_list:
+                                    goal_list.remove(linebreak)
+                            if None in goal_list:
+                                goal_list.remove(None)
+                            home_or_away = 'home_team' if goal_set == goals[0] else 'away_team'
+                            events = pd.concat([events, self._get_events_dict(goal_list,r,r[home_or_away])])
+                    matches = pd.concat([matches,pd.DataFrame([r])],sort=True)
 
-            elif ("Serie A" in template.name) or ("Champions League" in template.name) or ("Europa League" in template.name):
-                wt = WikiTable(str(template.name))
-                tables = pd.concat( [tables, wt.tables ] )
-
-        print(matches)
-        matches.sort_values(by="time", inplace=True)
+            elif ("Serie A" in template.name):
+                # or ("Champions League" in template.name) or ("Europa League" in template.name):
+                try:
+                    wt = WikiTable(str(template.name))
+                    tables = pd.concat( [tables, wt.tables ] )
+                except:
+                    logging.debug("No valid table.")
+        logging.debug(matches)
+        if "time" in matches.columns:
+            matches.sort_values(by="time", inplace=True)
 
         return {'club':club, 'matches':matches, 'events':events, 'tables': tables}
 
@@ -289,12 +356,12 @@ class WikiSeason(WikiPage):
             player_name = ''.join(ch for ch in player_name if ch not in set(string.punctuation)).strip()
 
             for t in mwparserfromhell.wikicode.parse_anything(event).filter_templates():
-                if t.name == "goal" or t.name == "yel":
+                if t.name.lower() == "goal" or t.name == "yel":
                     for i in range(0, len(t.params), 2):
                         event_desc = t.params[i+1] if len(t.params) > i+1 else ""
                         event_time = t.params[i].split('+')[0].strip()
                         if event_time.isdigit():
-                            events_list.append({'time' : event_time, 'player': player_name, 'type': str(t.name), 'desc' : event_desc, 'match_time':match_time, 'team': team, 'season':r['season']})
+                            events_list.append({'time' : event_time, 'player': player_name, 'type': str(t.name).lower(), 'desc' : event_desc, 'match_time':match_time, 'team': team, 'season':r['season']})
                 elif t.name == "sent off":
                     event_desc = "strt" if t.params[0] == '0' else "dbly"
                     event_time = t.params[1].strip()
@@ -311,13 +378,24 @@ class WikiTable(WikiPage):
     def _parse_table(self):
         i = 1
         j = True
-
+        logging.info(self.title)
         table = []
         for template in self.wikicode.filter_templates():
             if "Sports table" in template.name:
                 #table = []
-                while template.has("team" + str(i)):
-                    team_code = str(template.get("team" + str(i)).value).split()[0].strip()
+                team_codes = []
+                if template.has("team_order"):
+                    team_codes = template.get("team_order")
+                    team_codes = team_codes.split("=")[1].split("\n")[0].strip().split(",")
+                    team_codes = [team_code.strip() for team_code in team_codes]
+                else:
+                    while template.has("team" + str(i)):
+                        team_code = str(template.get("team" + str(i)).value).split()[0].strip()
+                        team_codes.append(team_code)
+                        i = i + 1
+
+                for i in range(1,len(team_codes)+1):
+                    team_code = team_codes[i-1]
                     team_wins = int(str(template.get("win_" + team_code).value).split()[0])
                     team_draws = int(str(template.get("draw_" + team_code).value).split()[0])
                     team_loss =  int(str(template.get("loss_" + team_code).value).split()[0])
