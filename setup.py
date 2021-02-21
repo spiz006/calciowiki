@@ -7,7 +7,7 @@ setup(
     version='0.5.1',
     description='Use wikipedia as a datasource.',
     author='Spiz ',
-    author_email='spizster@gmail.com',
+    author_email='spizster at gmail.com',
     url='https://github.com/',
     packages=['calciowiki'],
     install_requires=[
