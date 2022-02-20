@@ -3,6 +3,7 @@ import urllib.request
 import urllib.parse
 import re
 import parsedatetime
+import dateutil
 import datetime
 import time as timelib
 import json
@@ -15,12 +16,21 @@ import numpy as np
 from dateutil.parser import parse
 from io import BytesIO
 import requests
+import arrow
+
 class WikiPage(object):
     #competition_text = {"Serie A" : "Ser A", "Champions League" : "UCL", "Europa League" : "EL", "Coppa Italia": "CI", "Friendly": "Fr"}
     _api_url = "https://en.wikipedia.org/w/api.php"
+    _api_url_en = "https://en.wikipedia.org/w/api.php"
+    _api_url_it = "https://it.wikipedia.org/w/api.php"
 
-    def __init__(self, title):
+    def __init__(self, title, lang='en'):
         self.title = title
+        self.lang = lang
+        if lang == 'it':
+            self._api_url = self._api_url_it 
+        else:
+            self._api_url = self._api_url_en
         self.wikicode = self._get_page()
 
     def _get_page(self):
@@ -369,6 +379,261 @@ class WikiSeason(WikiPage):
                         events_list.append({'time' : event_time, 'player': player_name,'type': str(t.name), 'desc' : str(event_desc), 'match_time':match_time, 'team': team, 'season':r['season']})
         return pd.DataFrame(events_list)
 
+class WikiSeasonIt(WikiPage):
+    def __init__(self, title):
+        super(WikiSeasonIt,self).__init__(title=title,lang='it')
+        self.title = title
+        years = [wd for wd in title.split(' ') if '-' in wd][0].split('-')
+        self.year = f"{years[0][-2:]}-{years[1][-2:]}"
+        self.season = self._parse()
+
+    def _parse(self):
+        matches = pd.DataFrame()
+        events = pd.DataFrame()
+        tables = pd.DataFrame()
+        club = ""
+        for template in self.wikicode.filter_templates():
+            if template.name.matches("Stagione squadra"):
+                club = self._get_text(template.get("club").value)
+
+        logging.debug ("Processing season for club: %s." % club)
+
+        for template in self.wikicode.filter_templates():
+            if template.name.matches("Incontro di club") or template.name.matches("incontro di club"):
+                previous_headings = []
+                found = False
+                for section in self.wikicode.get_sections(levels=[3]):
+                    if section.contains(template):
+                        previous_headings = [heading for heading in section.filter_headings()]
+                        found=True
+                comp = previous_headings[0].title.strip_code().strip() if found else "Friendly"
+
+                team1_full = self._get_text(template.get("Squadra 1").value)
+                for l in template.get("Squadra 1").value.filter_wikilinks():
+                    team1_full = l.title
+
+                team2_full = self._get_text(template.get("Squadra 2").value)
+                for l in template.get("Squadra 2").value.filter_wikilinks():
+                    team2_full = l.title
+
+                ref_name = "N/A"
+                try:
+                    ref_name = re.sub(r'\([^)]*\)', '', self._get_text(template.get("Arbitro").value)).strip()
+                except:
+                    pass
+                # time = self._get_timestamp(template.get("date").value, template.get("time").value) if template.has("time") else self._get_timestamp(template.get("date").value)
+                date = f'{str(template.get("Giornomese").value).strip()} {str(template.get("Anno").value).strip()}' 
+                date = self._date_to_en(date)
+                time = self._get_text(template.get("Ora").value).strip()
+                if ':' not in time:
+                    time = "00:00" + time
+                tzmapping = {'CET': dateutil.tz.gettz('Europe/Berlin'),
+                            'CEST': dateutil.tz.gettz('Europe/Berlin')}
+
+                match_dt = dateutil.parser.parse(f'{date} {time}', tzinfos=tzmapping)
+                match_time = match_dt.timestamp()
+
+                r = {
+                        'season': self.year,
+                        'home_team' : self._get_text(template.get("Squadra 1").value),
+                        'home_full_name': str(team1_full),
+                        'away_team' : self._get_text(template.get("Squadra 2").value),
+                        'away_full_name':str(team2_full),
+                        'referee' : ref_name,
+                        'time' : match_time,
+                        'competition': comp
+                    }
+                # print(r)
+                if time is None:
+                    logging.info(f"Match dropped - {r['season']} {r['competition']}: {r['home_team']} - {r['away_team']}")
+                    continue
+                stadium_name = "N/A"
+                try:
+                    stadium_name = self._get_text(template.get("Stadio").value).strip()
+                except:
+                    pass
+                stadium = stadium_name
+                goals = str(template.get("Punteggio 1").value) + ' - ' + str(template.get("Punteggio 2").value)
+
+                r['home_goals'] = template.get("Punteggio 1").value.strip()
+                r['away_goals'] = template.get("Punteggio 2").value.strip()
+                r['h_a'] = 'H' if r['home_team'] in club else 'A'
+                r['result'] = 'D'
+                if r['home_goals'] > r['away_goals']:
+                    r['result'] = 'W' if r['h_a'] == 'H' else 'L'
+                elif r['home_goals'] < r['away_goals']:
+                    r['result'] = 'L' if r['h_a'] == 'H' else 'W'
+                
+                r['attendance'] = ""
+                # GET ATTENDANCE
+                if template.has("Spettatori") and 'formatnum' in template.get("Spettatori").value:
+                    af = template.get("Spettatori").value
+                    at = 'formatnum:'
+                    attendance = af[af.find(at)+len(at): af.find('}}')]
+                    r['attendance'] = attendance if attendance != "" and attendance.isdigit() else ""
+
+                # GET LOCATION
+                if template.has("Città"):
+                    location = self._get_text(template.get("Città").value)
+                    if len(location) < 64:
+                        location = stadium + ', ' + location if len(stadium) > 0 else location
+                    else:
+                        location = stadium
+                else:
+                    location = stadium
+                r['location'] = location
+
+                # GET COMPETITION
+
+                # if template.has("round"):
+                #     comp = template.get("round").value
+                #
+                #     comp_title = self._get_text(comp)
+                #     r['competition'] =  comp_title if len(comp_title.split()) == 1 else ".".join( [ w[0] for w in comp_title.split() ] )
+                #
+                #     if comp.strip_code().strip().isdigit():
+                #         r['competition'] = "Ser A"
+                #     if "Champions League" in comp:
+                #         r['competition'] = "UCL"
+                #     if "Europa League" in comp:
+                #         r['competition'] = "EL"
+                #     if "Coppa Italia" in comp:
+                #         r['competition'] = "CI"
+                #     if "Friendly" in comp:
+                #         r['competition'] = "Fr"
+                if len(r['home_team']) > 1 or len(r['away_team']) > 1:
+                    linebreaks = ["<br>","<br/>","<br />","*"]
+                    goals = ['Marcatori 1','Marcatori 2']
+                    for goal_set in goals:
+                        if template.has(goal_set):
+                            goal_list = re.split(r"(<br>)|(<br/>)|(<br />)|(\*)",str(template.get(goal_set).value))
+                            for linebreak in linebreaks:
+                                if linebreak in goal_list:
+                                    goal_list.remove(linebreak)
+                            if None in goal_list:
+                                goal_list.remove(None)
+                            home_or_away = 'home_team' if goal_set == goals[0] else 'away_team'
+                            events = pd.concat([events, self._get_events_dict(goal_list,r,r[home_or_away])])
+                    matches = pd.concat([matches,pd.DataFrame([r])],sort=True)
+
+            elif ("Serie A" in template.name):
+                # or ("Champions League" in template.name) or ("Europa League" in template.name):
+                try:
+                    wt = WikiTable(str(template.name))
+                    tables = pd.concat( [tables, wt.tables ] )
+                except:
+                    logging.debug("No valid table.")
+        # logging.debug(matches)
+        if "time" in matches.columns:
+            matches.sort_values(by="time", inplace=True)
+
+        return {'club':club, 'matches':matches, 'events':events, 'tables': tables}
+
+    def _date_to_en(self, date_it):
+        mesi = ['gennaio','febbraio','marzo','aprile','maggio','giunio','luglio','agosto','settembre','ottobre','novembre','dicembre']
+        parts = date_it.split()
+        for i in range(0,len(parts)):
+            if parts[i] in mesi:
+                parts[i] = str(mesi.index(parts[i])+1)
+            if parts[i].isdigit():
+                parts[i] = parts[i].zfill(2)
+            else:
+                num = ''
+                for l in parts[i]:
+                    num += l if l.isdigit() else ''
+                parts[i] = num.zfill(2)
+        return '/'.join(parts)
+
+    def _get_events_dict(self, team_events, r, team): # team_events as List
+        events_list = []
+        match_time = r['time']
+        for i,event in enumerate(team_events):
+            player_name = self._get_text(mwparserfromhell.wikicode.parse_anything(event))
+            player_name = ''.join(ch for ch in player_name if ch not in set(string.punctuation)).strip()
+
+            for t in mwparserfromhell.wikicode.parse_anything(event).filter_templates():
+                if t.name.lower() == "goal" or t.name == "yel":
+                    for i in range(0, len(t.params), 2):
+                        event_desc = str(t.params[i+1]) if len(t.params) > i+1 else ""
+                        event_dict = {'rig':'pen','aut':'og'}
+                        event_desc_en = event_dict[event_desc] if event_desc in event_dict else ""
+                        event_time = t.params[i].split('+')[0].strip()
+                        if event_time.isdigit():
+                            events_list.append({'time' : event_time, 'player': player_name, 'type': str(t.name).lower(), 'desc' : event_desc_en, 'match_time':match_time, 'team': team, 'season':r['season']})
+                elif t.name == "sent off":
+                    event_desc = "strt" if t.params[0] == '0' else "dbly"
+                    event_time = t.params[1].strip()
+                    if event_time.isdigit():
+                        events_list.append({'time' : event_time, 'player': player_name,'type': str(t.name), 'desc' : str(event_desc), 'match_time':match_time, 'team': team, 'season':r['season']})
+        return pd.DataFrame(events_list)
+
+class WikiClassifica(WikiPage):
+    def __init__(self, title):
+        super(WikiClassifica, self).__init__(title,lang='it')
+        self.title = title
+        self.classifica = self._parse_classifica()
+
+    def _table_to_html(self, t):
+        # if isinstance(t,str):
+        #   print(t.contents)
+        #   return t
+        attrs = " ".join([f'{a.name}="{a.value}"' for a in t.attributes])
+        if len(t.attributes) > 0:
+            attrs = " " + attrs
+        m = f'<{t.tag}{attrs}>'
+        if t.tag == 'table':
+            m+= '<thead>'
+        
+        for c in t.contents.filter(recursive=False):
+            if isinstance(c, mwparserfromhell.nodes.tag.Tag):
+                m += self._table_to_html(c)
+            elif isinstance(c,mwparserfromhell.nodes.text.Text):
+                # m += c.value
+                txt = mwparserfromhell.parse(c).strip_code().replace("'''","")
+                if txt == 'Squadra':
+                    txt = 'Team'
+                m += txt
+                pass
+            elif isinstance(c,mwparserfromhell.nodes.template.Template):
+                # m += str(mwparserfromhell.parse(c))
+                if c.name.startswith('Calcio femminile'):
+                    m += c.name[17:].strip()
+                    break
+                elif c.name.startswith('Calcio'):
+                    m += c.name[7:].strip()
+                    break      
+                elif c.name.lower() == 'simbolo':
+                    pass
+                elif c.name.lower() == 'abbr':
+                    abbrs = {'pos.':'Position','pt':'Points','g':'Played','v':'Won','n':'Draw','p':'Lost','gf':'Goals Scored','gs':'Goals Against','dr':'Goal Difference'}
+                    if c.params[0].lower() in abbrs:
+                        m += abbrs[c.params[0].lower()]
+                    else:
+                        m += c.params[-1] 
+            elif isinstance(c,mwparserfromhell.nodes.html_entity.HTMLEntity):
+                m += c.normalize()
+            else:
+                print(type(c))
+        m += f'</{t.closing_tag}>'
+        return m
+    
+    def _parse_classifica(self):
+        y = mwparserfromhell.parse(self.wikicode)
+        tables = []
+        for s in y.get_sections(flat=True):
+            if s[:s.find("\n")].lower().replace("=","").strip() == "classifica":
+                for c in s.filter_tags():
+                    if c.tag == 'table':
+                        tbl = self._table_to_html(c)
+                        ins = tbl.find("</th><tr")
+                        tbl = tbl[:ins+5] + "</thead>" + tbl[ins+5:]
+                        if 'Juventus' in tbl:
+                            df = pd.read_html(tbl)
+                            df = df[0].drop(['Unnamed: 0'], axis=1)
+                            df['Position'] = df['Position'].astype(int)
+                            return df
+        return None
+
 class WikiTable(WikiPage):
     def __init__(self, title):
         super(WikiTable, self).__init__('Template:' + title)
@@ -431,6 +696,7 @@ class WikiPageTables(WikiPage):
         self.tables = self._parse_tables()
 
     def _parse_tables(self):
+        print(self.wikicode)
         wc = mwparserfromhell.parse(self.wikicode.get_sections(matches=self.section))
         tbl = []
         for t in wc.filter_tags():
